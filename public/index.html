@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>SF Flow Test Automation</title>
+<style>
+  body { font-family: -apple-system, sans-serif; max-width: 860px; margin: 40px auto; padding: 0 16px; color: #1a1a1a; }
+  h1 { font-size: 20px; }
+  h2 { font-size: 16px; margin-top: 28px; }
+  #status { padding: 8px 12px; border-radius: 6px; margin: 12px 0; font-size: 14px; }
+  #status.yes { background: #e6f4ea; color: #1e7e34; }
+  #status.no { background: #fdecea; color: #a4262c; }
+  input[type=text] { width: 100%; padding: 8px; font-family: monospace; font-size: 13px; box-sizing: border-box; }
+  button { padding: 10px 16px; font-size: 14px; margin-top: 12px; cursor: pointer; }
+  button:disabled { cursor: not-allowed; opacity: 0.6; }
+  a.login { display: inline-block; margin-top: 8px; }
+  pre { background: #f5f5f5; padding: 12px; border-radius: 6px; overflow-x: auto; font-size: 12px; white-space: pre-wrap; }
+  .meta { font-size: 13px; color: #555; margin: 4px 0; }
+  .case { border: 1px solid #ddd; border-radius: 8px; padding: 12px 16px; margin: 10px 0; }
+  .case.passed { border-left: 4px solid #1e7e34; }
+  .case.failed { border-left: 4px solid #a4262c; }
+  .case.skipped { border-left: 4px solid #999; }
+  .badge { display: inline-block; font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 10px; text-transform: uppercase; }
+  .badge.passed { background: #e6f4ea; color: #1e7e34; }
+  .badge.failed { background: #fdecea; color: #a4262c; }
+  .badge.skipped { background: #eee; color: #666; }
+  .case-desc { margin: 6px 0; font-size: 14px; }
+  .failure { color: #a4262c; font-size: 13px; background: #fdecea; padding: 8px 10px; border-radius: 6px; margin-top: 6px; }
+  .screenshots { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+  .screenshots img { max-width: 260px; border: 1px solid #ccc; border-radius: 4px; cursor: pointer; }
+  table { border-collapse: collapse; width: 100%; margin-top: 8px; font-size: 13px; }
+  th, td { border: 1px solid #ddd; padding: 6px 8px; text-align: left; }
+  th { background: #f5f5f5; }
+  details { margin-top: 20px; }
+  summary { cursor: pointer; font-size: 13px; color: #555; }
+  .empty { color: #777; font-size: 13px; font-style: italic; }
+</style>
+</head>
+<body>
+  <h1>SF Flow Test Automation — local dev runner</h1>
+
+  <div id="status">Checking authentication…</div>
+  <a class="login" href="/oauth/login" style="display:none" id="loginLink">Login with Salesforce →</a>
+
+  <div id="runPanel" style="display:none">
+    <p>Path to a local <code>.flow-meta.xml</code> file:</p>
+    <input type="text" id="flowFilePath" value="/Users/Ravi/Desktop/sf-flow-test-automation/salesforce-metadata/force-app/main/default/flows/Flow_test.flow-meta.xml" />
+    <br />
+    <button id="runBtn">Run test</button>
+    <p id="runStatus"></p>
+    <div id="resultView"></div>
+  </div>
+
+<script>
+async function checkStatus() {
+  const res = await fetch('/oauth/status');
+  const { authenticated } = await res.json();
+  const statusEl = document.getElementById('status');
+  const loginLink = document.getElementById('loginLink');
+  const runPanel = document.getElementById('runPanel');
+  if (authenticated) {
+    statusEl.textContent = 'Authenticated with Salesforce.';
+    statusEl.className = 'yes';
+    loginLink.style.display = 'none';
+    runPanel.style.display = 'block';
+  } else {
+    statusEl.textContent = 'Not authenticated.';
+    statusEl.className = 'no';
+    loginLink.style.display = 'inline-block';
+    runPanel.style.display = 'none';
+  }
+}
+
+function escapeHtml(str) {
+  return String(str).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+function screenshotUrl(localPath) {
+  const base = localPath.split('/').pop();
+  return '/screenshots/' + encodeURIComponent(base);
+}
+
+function renderResult(run) {
+  const passed = run.caseResults.filter((c) => c.status === 'Passed').length;
+  const failed = run.caseResults.filter((c) => c.status === 'Failed').length;
+  const skipped = run.caseResults.filter((c) => c.status === 'Skipped').length;
+
+  const casesHtml = run.caseResults.map((c) => {
+    const cls = c.status.toLowerCase();
+    const shots = (c.screenshotPaths || []).map((p) =>
+      `<img src="${screenshotUrl(p)}" onclick="window.open(this.src, '_blank')" title="Click to view full size" />`
+    ).join('');
+    return `
+      <div class="case ${cls}">
+        <span class="badge ${cls}">${c.status}</span>
+        <div class="case-desc"><strong>${escapeHtml(c.testCaseId)}</strong> — ${escapeHtml(c.description)}</div>
+        ${c.screenApiName ? `<div class="meta">Screen: ${escapeHtml(c.screenApiName)}</div>` : ''}
+        <div class="meta">Executed at ${escapeHtml(c.executedAt)}</div>
+        ${c.failureReason ? `<div class="failure">${escapeHtml(c.failureReason)}</div>` : ''}
+        ${shots ? `<div class="screenshots">${shots}</div>` : ''}
+      </div>`;
+  }).join('');
+
+  const recordsHtml = run.capturedRecords.length === 0
+    ? '<p class="empty">No records captured — either no DML fired, or the running flow never reached the DML step in any test case.</p>'
+    : `<table>
+        <tr><th>Object</th><th>Operation</th><th>Record</th><th>Fields</th></tr>
+        ${run.capturedRecords.map((r) => `
+          <tr>
+            <td>${escapeHtml(r.objectApiName)}</td>
+            <td>${escapeHtml(r.operation)}</td>
+            <td><a href="${escapeHtml(r.recordUrl)}" target="_blank">${escapeHtml(r.recordId)}</a></td>
+            <td><pre style="margin:0">${escapeHtml(JSON.stringify(r.fieldSnapshot, null, 2))}</pre></td>
+          </tr>`).join('')}
+      </table>`;
+
+  return `
+    <h2>${escapeHtml(run.flowLabel)} <span class="meta">(${escapeHtml(run.flowApiName)})</span></h2>
+    <div class="meta">Environment: ${escapeHtml(run.environment)}</div>
+    <div class="meta">${escapeHtml(run.startTime)} → ${escapeHtml(run.endTime)}</div>
+    <div class="meta"><strong>${passed} passed</strong>, <strong>${failed} failed</strong>, <strong>${skipped} skipped</strong> (${run.caseResults.length} total)</div>
+
+    <h2>Test cases</h2>
+    ${casesHtml}
+
+    <h2>Records created/modified during this run</h2>
+    ${recordsHtml}
+
+    <details>
+      <summary>Test plan (markdown)</summary>
+      <pre>${escapeHtml(run.testPlanMarkdown)}</pre>
+    </details>
+    <details>
+      <summary>Raw JSON</summary>
+      <pre>${escapeHtml(JSON.stringify(run, null, 2))}</pre>
+    </details>
+  `;
+}
+
+document.getElementById('runBtn').addEventListener('click', async () => {
+  const btn = document.getElementById('runBtn');
+  const runStatus = document.getElementById('runStatus');
+  const resultView = document.getElementById('resultView');
+  const flowFilePath = document.getElementById('flowFilePath').value.trim();
+
+  btn.disabled = true;
+  runStatus.textContent = 'Running — this drives a real local Chromium browser against your org, may take a bit…';
+  resultView.innerHTML = '';
+
+  try {
+    const res = await fetch('/api/test-runs', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ flowFilePath }),
+    });
+    const data = await res.json();
+    if (res.ok && data.result) {
+      runStatus.textContent = 'Done.';
+      resultView.innerHTML = renderResult(data.result);
+    } else {
+      runStatus.textContent = 'Failed — see details below.';
+      resultView.innerHTML = `<pre>${escapeHtml(JSON.stringify(data, null, 2))}</pre>`;
+    }
+  } catch (err) {
+    runStatus.textContent = 'Request failed: ' + err;
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+checkStatus();
+</script>
+</body>
+</html>

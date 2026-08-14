@@ -1,0 +1,161 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Flow xmlns="http://soap.sforce.com/2006/04/metadata">
+    <apiVersion>60.0</apiVersion>
+    <interviewLabel>Demo Contact Intake {!$Flow.CurrentDateTime}</interviewLabel>
+    <label>Demo Contact Intake</label>
+    <processType>Flow</processType>
+    <status>Active</status>
+
+    <start>
+        <locationX>50</locationX>
+        <locationY>50</locationY>
+        <connector>
+            <targetReference>Contact_Type_Screen</targetReference>
+        </connector>
+    </start>
+
+    <!-- Screen 1: dropdown drives a SAME-screen conditionally visible field -->
+    <screens>
+        <name>Contact_Type_Screen</name>
+        <label>Contact Type</label>
+        <locationX>50</locationX>
+        <locationY>150</locationY>
+        <allowBack>true</allowBack>
+        <allowFinish>true</allowFinish>
+        <allowPause>true</allowPause>
+        <connector>
+            <targetReference>Contact_Details_Screen</targetReference>
+        </connector>
+        <fields>
+            <name>Contact_Type</name>
+            <choiceReferences>Existing_Choice</choiceReferences>
+            <choiceReferences>New_Choice</choiceReferences>
+            <dataType>String</dataType>
+            <fieldText>Contact Type</fieldText>
+            <fieldType>DropdownBox</fieldType>
+            <isRequired>true</isRequired>
+        </fields>
+        <fields>
+            <!-- Same-screen conditional visibility: only shown when
+                 Contact_Type (above, on this same screen) = "Existing" -->
+            <name>Existing_Contact_Note</name>
+            <dataType>String</dataType>
+            <fieldText>Note about existing contact</fieldText>
+            <fieldType>InputField</fieldType>
+            <isRequired>false</isRequired>
+            <visibilityRule>
+                <conditionLogic>1</conditionLogic>
+                <conditions>
+                    <leftValueReference>Contact_Type</leftValueReference>
+                    <operator>EqualTo</operator>
+                    <rightValue>
+                        <stringValue>Existing</stringValue>
+                    </rightValue>
+                </conditions>
+            </visibilityRule>
+        </fields>
+    </screens>
+
+    <!-- Screen 2: required fields, plus a CROSS-screen conditionally
+         visible field referencing Screen 1's dropdown -->
+    <screens>
+        <name>Contact_Details_Screen</name>
+        <label>Contact Details</label>
+        <locationX>50</locationX>
+        <locationY>250</locationY>
+        <allowBack>true</allowBack>
+        <allowFinish>true</allowFinish>
+        <allowPause>true</allowPause>
+        <connector>
+            <targetReference>Create_Contact</targetReference>
+        </connector>
+        <fields>
+            <name>First_Name</name>
+            <dataType>String</dataType>
+            <fieldText>First Name</fieldText>
+            <fieldType>InputField</fieldType>
+            <isRequired>true</isRequired>
+        </fields>
+        <fields>
+            <name>Last_Name</name>
+            <dataType>String</dataType>
+            <fieldText>Last Name</fieldText>
+            <fieldType>InputField</fieldType>
+            <isRequired>true</isRequired>
+        </fields>
+        <fields>
+            <!-- Cross-screen conditional visibility: only shown when
+                 Contact_Type (from the PRIOR screen) = "New" -->
+            <name>Email</name>
+            <dataType>String</dataType>
+            <fieldText>Email</fieldText>
+            <fieldType>InputField</fieldType>
+            <isRequired>true</isRequired>
+            <visibilityRule>
+                <conditionLogic>1</conditionLogic>
+                <conditions>
+                    <leftValueReference>Contact_Type</leftValueReference>
+                    <operator>EqualTo</operator>
+                    <rightValue>
+                        <stringValue>New</stringValue>
+                    </rightValue>
+                </conditions>
+            </visibilityRule>
+        </fields>
+        <fields>
+            <!-- Deliberately included: an unsupported custom component
+                 field, so the parser's flagging path has something real
+                 to exercise. -->
+            <name>Contact_Photo</name>
+            <dataType>String</dataType>
+            <fieldText>Contact Photo</fieldText>
+            <fieldType>ComponentInstance</fieldType>
+            <extensionName>c:customPhotoUploader</extensionName>
+            <isRequired>false</isRequired>
+        </fields>
+    </screens>
+
+    <!-- DML: creates the Contact record from the collected screen values -->
+    <recordCreates>
+        <name>Create_Contact</name>
+        <label>Create Contact</label>
+        <locationX>50</locationX>
+        <locationY>350</locationY>
+        <object>Contact</object>
+        <inputAssignments>
+            <field>FirstName</field>
+            <value>
+                <elementReference>First_Name</elementReference>
+            </value>
+        </inputAssignments>
+        <inputAssignments>
+            <field>LastName</field>
+            <value>
+                <elementReference>Last_Name</elementReference>
+            </value>
+        </inputAssignments>
+        <inputAssignments>
+            <field>Email</field>
+            <value>
+                <elementReference>Email</elementReference>
+            </value>
+        </inputAssignments>
+    </recordCreates>
+
+    <choices>
+        <name>Existing_Choice</name>
+        <choiceText>Existing Contact</choiceText>
+        <dataType>String</dataType>
+        <value>
+            <stringValue>Existing</stringValue>
+        </value>
+    </choices>
+    <choices>
+        <name>New_Choice</name>
+        <choiceText>New Contact</choiceText>
+        <dataType>String</dataType>
+        <value>
+            <stringValue>New</stringValue>
+        </value>
+    </choices>
+</Flow>

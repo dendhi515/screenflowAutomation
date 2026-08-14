@@ -1,0 +1,11 @@
+{
+  "packageDirectories": [
+    {
+      "path": "force-app",
+      "default": true
+    }
+  ],
+  "name": "sf-flow-test-automation-metadata",
+  "namespace": "",
+  "sourceApiVersion": "60.0"
+}

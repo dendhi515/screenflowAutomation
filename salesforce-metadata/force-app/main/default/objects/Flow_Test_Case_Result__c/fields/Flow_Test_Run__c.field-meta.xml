@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Flow_Test_Run__c</fullName>
+    <label>Flow Test Run</label>
+    <referenceTo>Flow_Test_Run__c</referenceTo>
+    <relationshipLabel>Test Case Results</relationshipLabel>
+    <relationshipName>Test_Case_Results</relationshipName>
+    <type>MasterDetail</type>
+    <writeRequiresMasterRead>false</writeRequiresMasterRead>
+    <reparentableMasterDetail>false</reparentableMasterDetail>
+</CustomField>

@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.env
+*.log
+screenshots/
+sf-flow-test-automation@0.1.0
+ts-node-dev

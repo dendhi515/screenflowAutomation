@@ -32,6 +32,12 @@ interface AssertionOutcome {
   failureReason?: string;
   navigatedAlready?: boolean;
   screenshotPath?: string;
+  /** Set only for RecordFieldEquals — can't be verified mid-browser-run (no
+   *  Salesforce connection here, deliberately). Caller collects these into
+   *  TestCaseExecutionResult.pendingRecordAssertions for
+   *  recordAssertionReconciler.ts to resolve afterward against DML actually
+   *  captured for this test case. */
+  pending?: ExpectedAssertion;
 }
 
 const SCREENSHOT_DIR = path.join(process.cwd(), "screenshots");
@@ -75,6 +81,7 @@ export async function runScreenFlowTestCase(
   // real browser live during a run — see config.ts.
   const browser = await chromium.launch({ headless: config.playwrightHeadless, slowMo: config.playwrightHeadless ? 0 : 250 });
   const screenshotPaths: string[] = [];
+  const pendingRecordAssertions: ExpectedAssertion[] = [];
   let page: Page | undefined;
   try {
     const context = await browser.newContext();
@@ -115,6 +122,10 @@ export async function runScreenFlowTestCase(
         const outcome = await evaluateAssertion(page, assertion, testCase.id);
         if (outcome.screenshotPath) screenshotPaths.push(outcome.screenshotPath);
         if (outcome.navigatedAlready) navigatedByAssertion = true;
+        if (outcome.pending) {
+          pendingRecordAssertions.push(outcome.pending);
+          continue;
+        }
         if (!outcome.passed) {
           return {
             testCaseId: testCase.id,
@@ -151,6 +162,7 @@ export async function runScreenFlowTestCase(
       status: "Passed",
       executedAt,
       screenshotPaths: screenshotPaths.length > 0 ? screenshotPaths : undefined,
+      pendingRecordAssertions: pendingRecordAssertions.length > 0 ? pendingRecordAssertions : undefined,
     };
   } catch (err) {
     return {
@@ -216,12 +228,52 @@ async function evaluateAssertion(page: Page, assertion: ExpectedAssertion, testC
           };
     }
 
-    case "FieldValueEquals":
+    case "FieldValueEquals": {
+      const rendered = await readFieldValue(locator);
+      if (rendered === undefined) {
+        return {
+          passed: false,
+          failureReason: `Expected field "${assertion.targetLabel}" to equal "${assertion.expectedValue}" but its rendered value could not be read (not visible, or not a recognized input type).`,
+        };
+      }
+      const matches = String(rendered) === String(assertion.expectedValue);
+      return matches
+        ? { passed: true }
+        : { passed: false, failureReason: `Expected field "${assertion.targetLabel}" to equal "${assertion.expectedValue}" but found "${rendered}".` };
+    }
+
     case "RecordFieldEquals":
+      // Can't verify a DML'd record's field value mid-browser-run — no
+      // Salesforce connection here, deliberately (see module doc comment).
+      // Stamped as pending; orchestrator.ts captures DML for this specific
+      // test case right after it finishes, and
+      // recordAssertionReconciler.ts resolves this against what was
+      // actually captured.
+      return { passed: true, pending: assertion };
+
     default:
-      // Not yet implemented — see README known gaps. Left unasserted
-      // rather than reporting a false pass.
       return { passed: true };
+  }
+}
+
+/** Reads a field's current rendered value for FieldValueEquals — checkbox/
+ *  radio state via isChecked(), text/number/date/select via inputValue(),
+ *  falling back to trimmed textContent for anything else (e.g. a rendered
+ *  DisplayText or a component that doesn't expose a standard input value). */
+async function readFieldValue(locator: ReturnType<Page["getByLabel"]>): Promise<string | boolean | undefined> {
+  try {
+    const tagName = await locator.evaluate((el) => el.tagName.toLowerCase());
+    if (tagName === "input") {
+      const inputType = await locator.evaluate((el) => (el as HTMLInputElement).type);
+      if (inputType === "checkbox" || inputType === "radio") return await locator.isChecked();
+      return await locator.inputValue();
+    }
+    if (tagName === "textarea" || tagName === "select") {
+      return await locator.inputValue();
+    }
+    return (await locator.textContent())?.trim() ?? undefined;
+  } catch {
+    return undefined;
   }
 }
 

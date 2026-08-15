@@ -1,0 +1,282 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Flow xmlns="http://soap.sforce.com/2006/04/metadata">
+    <apiVersion>60.0</apiVersion>
+    <interviewLabel>Demo Approval Routing {!$Flow.CurrentDateTime}</interviewLabel>
+    <label>Demo Approval Routing</label>
+    <processType>Flow</processType>
+    <status>Active</status>
+
+    <!-- Branching + loop fixture: exercises Decision (2 outcomes),
+         multi-condition (AND) field visibility, and a Loop — none of which
+         examples/Demo_Contact_Intake.flow-meta.xml has, so this is what
+         validates enumeratePaths()/solveInputsForOutcome() against real
+         branching rather than only a single linear path. -->
+
+    <variables>
+        <name>Related_Email_Collection</name>
+        <dataType>String</dataType>
+        <isCollection>true</isCollection>
+        <isInput>false</isInput>
+        <isOutput>false</isOutput>
+    </variables>
+
+    <start>
+        <locationX>50</locationX>
+        <locationY>50</locationY>
+        <connector>
+            <targetReference>Contact_Type_Screen</targetReference>
+        </connector>
+    </start>
+
+    <!-- Screen 1: two dropdowns — Contact_Type drives the Decision below,
+         Priority (same screen) combines with it for an AND-visibility field
+         on a later screen. -->
+    <screens>
+        <name>Contact_Type_Screen</name>
+        <label>Contact Type</label>
+        <locationX>50</locationX>
+        <locationY>150</locationY>
+        <allowBack>true</allowBack>
+        <allowFinish>true</allowFinish>
+        <allowPause>true</allowPause>
+        <connector>
+            <targetReference>Route_Contact</targetReference>
+        </connector>
+        <fields>
+            <name>Contact_Type</name>
+            <choiceReferences>Existing_Choice</choiceReferences>
+            <choiceReferences>New_Choice</choiceReferences>
+            <dataType>String</dataType>
+            <fieldText>Contact Type</fieldText>
+            <fieldType>DropdownBox</fieldType>
+            <isRequired>true</isRequired>
+        </fields>
+        <fields>
+            <name>Priority</name>
+            <choiceReferences>Priority_High_Choice</choiceReferences>
+            <choiceReferences>Priority_Normal_Choice</choiceReferences>
+            <dataType>String</dataType>
+            <fieldText>Priority</fieldText>
+            <fieldType>DropdownBox</fieldType>
+            <isRequired>true</isRequired>
+        </fields>
+    </screens>
+
+    <!-- Decision: routes on Contact_Type. "New_Path" outcome is the only
+         named rule; everything else (including Contact_Type = "Existing")
+         falls through defaultConnector. -->
+    <decisions>
+        <name>Route_Contact</name>
+        <label>Route Contact</label>
+        <locationX>50</locationX>
+        <locationY>250</locationY>
+        <defaultConnectorLabel>Existing</defaultConnectorLabel>
+        <defaultConnector>
+            <targetReference>Existing_Contact_Screen</targetReference>
+        </defaultConnector>
+        <rules>
+            <name>New_Path</name>
+            <label>New Contact</label>
+            <conditionLogic>1</conditionLogic>
+            <conditions>
+                <leftValueReference>Contact_Type</leftValueReference>
+                <operator>EqualTo</operator>
+                <rightValue>
+                    <stringValue>New</stringValue>
+                </rightValue>
+            </conditions>
+            <connector>
+                <targetReference>New_Contact_Screen</targetReference>
+            </connector>
+        </rules>
+    </decisions>
+
+    <!-- Outcome branch: New contact. Escalation_Note is only visible when
+         BOTH Contact_Type = "New" (prior screen) AND Priority = "High"
+         (also prior screen) — real conditionLogic "1 AND 2" coverage. -->
+    <screens>
+        <name>New_Contact_Screen</name>
+        <label>New Contact Details</label>
+        <locationX>150</locationX>
+        <locationY>350</locationY>
+        <allowBack>true</allowBack>
+        <allowFinish>true</allowFinish>
+        <allowPause>true</allowPause>
+        <connector>
+            <targetReference>Loop_Related_Emails</targetReference>
+        </connector>
+        <fields>
+            <name>First_Name</name>
+            <dataType>String</dataType>
+            <fieldText>First Name</fieldText>
+            <fieldType>InputField</fieldType>
+            <isRequired>true</isRequired>
+        </fields>
+        <fields>
+            <name>Last_Name</name>
+            <dataType>String</dataType>
+            <fieldText>Last Name</fieldText>
+            <fieldType>InputField</fieldType>
+            <isRequired>true</isRequired>
+        </fields>
+        <fields>
+            <name>Escalation_Note</name>
+            <dataType>String</dataType>
+            <fieldText>Escalation Note</fieldText>
+            <fieldType>InputField</fieldType>
+            <isRequired>false</isRequired>
+            <visibilityRule>
+                <conditionLogic>1 AND 2</conditionLogic>
+                <conditions>
+                    <leftValueReference>Contact_Type</leftValueReference>
+                    <operator>EqualTo</operator>
+                    <rightValue>
+                        <stringValue>New</stringValue>
+                    </rightValue>
+                </conditions>
+                <conditions>
+                    <leftValueReference>Priority</leftValueReference>
+                    <operator>EqualTo</operator>
+                    <rightValue>
+                        <stringValue>High</stringValue>
+                    </rightValue>
+                </conditions>
+            </visibilityRule>
+        </fields>
+    </screens>
+
+    <!-- Default branch: Existing contact. -->
+    <screens>
+        <name>Existing_Contact_Screen</name>
+        <label>Existing Contact Details</label>
+        <locationX>-50</locationX>
+        <locationY>350</locationY>
+        <allowBack>true</allowBack>
+        <allowFinish>true</allowFinish>
+        <allowPause>true</allowPause>
+        <connector>
+            <targetReference>Loop_Related_Emails</targetReference>
+        </connector>
+        <fields>
+            <name>Existing_Account_Note</name>
+            <dataType>String</dataType>
+            <fieldText>Existing Account Note</fieldText>
+            <fieldType>InputField</fieldType>
+            <isRequired>true</isRequired>
+        </fields>
+    </screens>
+
+    <!-- Loop: iterates Related_Email_Collection. Body is a single screen
+         that connects back to the loop element to continue; exit goes to
+         Final_Screen once the collection is exhausted. -->
+    <loops>
+        <name>Loop_Related_Emails</name>
+        <label>Loop Related Emails</label>
+        <locationX>50</locationX>
+        <locationY>450</locationY>
+        <collectionReference>Related_Email_Collection</collectionReference>
+        <iterationOrder>Asc</iterationOrder>
+        <nextValueConnector>
+            <targetReference>Related_Email_Screen</targetReference>
+        </nextValueConnector>
+        <noMoreValuesConnector>
+            <targetReference>Final_Screen</targetReference>
+        </noMoreValuesConnector>
+    </loops>
+
+    <screens>
+        <name>Related_Email_Screen</name>
+        <label>Related Email</label>
+        <locationX>150</locationX>
+        <locationY>550</locationY>
+        <allowBack>false</allowBack>
+        <allowFinish>true</allowFinish>
+        <allowPause>true</allowPause>
+        <connector>
+            <targetReference>Loop_Related_Emails</targetReference>
+        </connector>
+        <fields>
+            <name>Related_Email_Display</name>
+            <dataType>String</dataType>
+            <fieldText>Current related email: {!Loop_Related_Emails}</fieldText>
+            <fieldType>DisplayText</fieldType>
+            <isRequired>false</isRequired>
+        </fields>
+    </screens>
+
+    <screens>
+        <name>Final_Screen</name>
+        <label>Review and Submit</label>
+        <locationX>50</locationX>
+        <locationY>650</locationY>
+        <allowBack>false</allowBack>
+        <allowFinish>true</allowFinish>
+        <allowPause>false</allowPause>
+        <connector>
+            <targetReference>Create_Contact</targetReference>
+        </connector>
+        <fields>
+            <name>Final_Notes</name>
+            <dataType>String</dataType>
+            <fieldText>Final Notes</fieldText>
+            <fieldType>InputField</fieldType>
+            <isRequired>false</isRequired>
+        </fields>
+    </screens>
+
+    <!-- DML: creates the Contact record. FirstName/LastName only ever get
+         real values on the New_Path branch — that asymmetry is deliberate,
+         mirroring what a real flow with branch-specific fields looks like. -->
+    <recordCreates>
+        <name>Create_Contact</name>
+        <label>Create Contact</label>
+        <locationX>50</locationX>
+        <locationY>750</locationY>
+        <object>Contact</object>
+        <inputAssignments>
+            <field>FirstName</field>
+            <value>
+                <elementReference>First_Name</elementReference>
+            </value>
+        </inputAssignments>
+        <inputAssignments>
+            <field>LastName</field>
+            <value>
+                <elementReference>Last_Name</elementReference>
+            </value>
+        </inputAssignments>
+    </recordCreates>
+
+    <choices>
+        <name>Existing_Choice</name>
+        <choiceText>Existing Contact</choiceText>
+        <dataType>String</dataType>
+        <value>
+            <stringValue>Existing</stringValue>
+        </value>
+    </choices>
+    <choices>
+        <name>New_Choice</name>
+        <choiceText>New Contact</choiceText>
+        <dataType>String</dataType>
+        <value>
+            <stringValue>New</stringValue>
+        </value>
+    </choices>
+    <choices>
+        <name>Priority_High_Choice</name>
+        <choiceText>High</choiceText>
+        <dataType>String</dataType>
+        <value>
+            <stringValue>High</stringValue>
+        </value>
+    </choices>
+    <choices>
+        <name>Priority_Normal_Choice</name>
+        <choiceText>Normal</choiceText>
+        <dataType>String</dataType>
+        <value>
+            <stringValue>Normal</stringValue>
+        </value>
+    </choices>
+</Flow>

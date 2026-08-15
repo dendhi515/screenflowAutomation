@@ -1,150 +1,139 @@
-import { FlowModel, FlowScreen, FlowField, FlowCondition } from "../../types/flowModel";
-import { TestSpec, TestCase, ScreenTestStep, ExpectedAssertion, FieldInput } from "../../types/testSpec";
-import { generateFieldInputs, fillableFields } from "./testDataGenerator";
+import { FlowModel, FlowScreen, FlowField, FlowGraphNode, FlowDecision, FlowPath } from "../../types/flowModel";
+import { TestSpec, TestCase, ScreenTestStep, ExpectedAssertion } from "../../types/testSpec";
+import { generateFieldInputs, buildScreenInputs, fillableFields } from "./testDataGenerator";
+import { evaluateConditionGroup, solveInputsForOutcome, buildEvaluationContext, mergeAssignments, KnownValue } from "./conditionEvaluator";
+import { isLlmConfigured, LlmScenarioProvider } from "./llmProvider";
+import { ClaudeScenarioProvider } from "./providers/claudeProvider";
+import { GroqScenarioProvider } from "./providers/groqProvider";
+import { validateScenarioProposals } from "./scenarioValidator";
+import { compileScenarios } from "./scenarioCompiler";
 import { config } from "../../config";
-import { isLlmConfigured } from "./llmProvider";
 
 /**
- * Stage 2b — test case generation (design doc addendum: local-file pivot).
+ * Stage 2b — deterministic test case generation.
  *
- * Visibility conditions are structured (leftValueReference/operator/
- * rightValue), not free-text formulas — see the design discussion. This
- * generator evaluates EqualTo/NotEqualTo conditions itself so it knows
- * what SHOULD happen before Playwright checks what DOES happen. Any other
- * operator is left unasserted with a logged warning rather than guessed —
- * consistent with the "flag, don't fake" approach used for unsupported
- * custom components.
+ * Generates one TestCase set per FlowPath (flowModel.paths — branch
+ * coverage, see flowAnalyzer.ts). For each path:
+ *  1. Solve the assignment values needed to actually route into it (its
+ *     Decision outcomes), via conditionEvaluator's solveInputsForOutcome —
+ *     an unsolvable route means the path can't be reliably driven, so it's
+ *     dropped with a note rather than tested on a guess.
+ *  2. Layer one additional scenario per conditional (visibilityRule) field
+ *     on the path, whose own solved assignment doesn't contradict the
+ *     path's base routing — each such scenario doubles as proof the field
+ *     becomes visible and, since every OTHER conditional field on the path
+ *     is re-evaluated in that same scenario's context, also exercises
+ *     whichever fields it makes newly hidden.
+ *  3. One required-field boundary case per unconditionally-required field.
  *
- * If an LLM provider is configured, generateTestSpec delegates test case
- * *wording* / plan narrative to it later; the deterministic path below
- * remains the source of truth for what gets asserted, since visibility
- * correctness shouldn't depend on an LLM getting a formula right.
+ * This is deliberately the coverage baseline that always runs — see
+ * providers/claudeProvider.ts (added on top later) for LLM-proposed
+ * scenarios layered on top of this, additively and failure-isolated.
  */
 
-function screensInPath(flowModel: FlowModel): FlowScreen[] {
-  return flowModel.path.filter((n): n is FlowScreen => n.kind === "Screen");
-}
-
-function evaluateCondition(condition: FlowCondition, driverValue: string): boolean | undefined {
-  const expected = String(condition.rightValueLiteral);
-  switch (condition.operator) {
-    case "EqualTo":
-      return driverValue === expected;
-    case "NotEqualTo":
-      return driverValue !== expected;
-    default:
-      console.warn(
-        `Visibility operator "${condition.operator}" on ${condition.leftValueReference} is not evaluated — leaving unasserted rather than guessing.`
-      );
-      return undefined;
-  }
-}
-
-interface ConditionalField {
-  screen: FlowScreen;
-  field: FlowField;
-  driverApiName: string;
-}
-
-function collectConditionalFields(screens: FlowScreen[]): ConditionalField[] {
-  const result: ConditionalField[] = [];
-  for (const screen of screens) {
-    for (const field of screen.fields) {
-      const rule = field.visibilityRule;
-      if (rule && rule.conditions.length === 1) {
-        // v1 scope: single-condition rules only (matches the demo flow and
-        // the scoped-down request). Multi-condition conditionLogic (AND/OR
-        // combinations) is real Flow behavior but deferred — see design doc.
-        result.push({ screen, field, driverApiName: rule.conditions[0].leftValueReference });
-      } else if (rule) {
-        console.warn(`Field ${field.apiName} has a multi-condition visibility rule — deferred, leaving unasserted.`);
-      }
+function controllableFieldsUpTo(pathNodes: FlowGraphNode[], indexInclusive: number): Map<string, FlowField> {
+  const map = new Map<string, FlowField>();
+  for (let i = 0; i <= indexInclusive; i++) {
+    const node = pathNodes[i];
+    if (node.kind === "Screen") {
+      for (const f of node.fields) map.set(f.apiName, f);
     }
   }
-  return result;
+  return map;
 }
 
-/** Distinct literal values worth testing for a given driver field, taken
- *  from the literals actually referenced by conditions that depend on it. */
-function distinctDriverValues(conditionalFields: ConditionalField[], driverApiName: string): string[] {
-  const values = new Set<string>();
-  for (const cf of conditionalFields) {
-    if (cf.driverApiName !== driverApiName) continue;
-    const literal = cf.field.visibilityRule?.conditions[0].rightValueLiteral;
-    if (literal !== undefined) values.add(String(literal));
-  }
-  return [...values];
+function scenarioKey(scenario: Record<string, KnownValue>): string {
+  return Object.keys(scenario)
+    .sort()
+    .map((k) => `${k}=${scenario[k]}`)
+    .join("&");
 }
 
-function buildStepsForScenario(
-  screens: FlowScreen[],
-  conditionalFields: ConditionalField[],
-  driverApiName: string,
-  driverValue: string,
-  unsupportedNotes: string[]
-): { steps: ScreenTestStep[]; description: string } {
-  const steps: ScreenTestStep[] = [];
+function describeScenarioDelta(scenario: Record<string, KnownValue>, base: Record<string, KnownValue>): string {
+  const deltaKeys = Object.keys(scenario).filter((k) => !(k in base) || String(base[k]) !== String(scenario[k]));
+  if (deltaKeys.length === 0) return "happy-path";
+  return deltaKeys.map((k) => `${k}=${scenario[k]}`).join("_");
+}
 
+/** The value every field is actually going to be filled with in this
+ *  scenario — scenario override where one exists, else the same default
+ *  valid value buildScreenInputs would use. Needed so the evaluation
+ *  context reflects what's really about to be typed into the browser, not
+ *  just the fields a scenario deliberately targets. */
+function computeKnownValuesForScenario(screens: FlowScreen[], scenario: Record<string, KnownValue>): Record<string, KnownValue> {
+  const values: Record<string, KnownValue> = {};
   for (const screen of screens) {
-    const { valid } = generateFieldInputs(screen.fields);
+    for (const input of buildScreenInputs(screen.fields, scenario)) {
+      values[input.apiName] = input.value as KnownValue;
+    }
+  }
+  return values;
+}
+
+function buildStepsForScenario(path: FlowPath, screens: FlowScreen[], scenario: Record<string, KnownValue>, unsupportedNotes: string[]): ScreenTestStep[] {
+  const knownValues = computeKnownValuesForScenario(screens, scenario);
+  const ctx = buildEvaluationContext(path.nodes, knownValues);
+
+  return screens.map((screen) => {
+    const excluded = new Set<string>();
     const assertions: ExpectedAssertion[] = [];
-    const excludedApiNames = new Set<string>();
 
     for (const field of screen.fields) {
       if (field.kind === "UnsupportedCustomComponent") {
         unsupportedNotes.push(
           `Screen "${screen.label}" field "${field.apiName}" uses an unsupported custom component (${field.unsupportedComponentName}) — needs manual test data, not auto-filled.`
         );
-        excludedApiNames.add(field.apiName);
+        excluded.add(field.apiName);
         continue;
       }
+      if (!field.visibilityRule) continue;
 
-      const conditional = conditionalFields.find((cf) => cf.field.apiName === field.apiName);
-      if (!conditional || conditional.driverApiName !== driverApiName) continue;
-
-      const condition = field.visibilityRule!.conditions[0];
-      const isVisible = evaluateCondition(condition, driverValue);
-      if (isVisible === undefined) continue; // unsupported operator — already warned
-
-      if (isVisible) {
+      const isVisible = evaluateConditionGroup(field.visibilityRule, ctx);
+      if (isVisible === true) {
         assertions.push({
           type: "FieldPresent",
           targetApiName: field.apiName,
           targetLabel: field.label,
-          description: `${field.label} should be visible when ${driverApiName} = "${driverValue}"`,
+          description: `${field.label} should be visible in this scenario`,
         });
-      } else {
+      } else if (isVisible === false) {
         assertions.push({
           type: "FieldAbsent",
           targetApiName: field.apiName,
           targetLabel: field.label,
-          description: `${field.label} should be hidden when ${driverApiName} = "${driverValue}"`,
+          description: `${field.label} should be hidden in this scenario`,
         });
-        excludedApiNames.add(field.apiName); // don't attempt to fill a field we expect to be hidden
+        excluded.add(field.apiName);
+      } else {
+        unsupportedNotes.push(
+          `Field "${field.apiName}" on screen "${screen.label}" has a visibility condition that couldn't be statically evaluated for this scenario — left unasserted rather than guessed.`
+        );
       }
     }
 
-    const inputs: FieldInput[] = valid
-      .filter((i) => !excludedApiNames.has(i.apiName))
-      .map((i) => (i.apiName === driverApiName ? { ...i, value: driverValue } : i));
-
-    steps.push({ screenApiName: screen.apiName, inputs, assertions });
-  }
-
-  return { steps, description: `Run flow with ${driverApiName} = "${driverValue}" and verify conditional field visibility` };
+    const inputs = buildScreenInputs(screen.fields, scenario).filter((i) => !excluded.has(i.apiName));
+    return { screenApiName: screen.apiName, inputs, assertions };
+  });
 }
 
-function buildRequiredFieldBoundaryCase(screens: FlowScreen[], targetField: FlowField, targetScreen: FlowScreen): TestCase {
+function buildRequiredFieldBoundaryCase(
+  path: FlowPath,
+  screens: FlowScreen[],
+  targetField: FlowField,
+  targetScreen: FlowScreen,
+  baseOverrides: Record<string, KnownValue>
+): TestCase {
   const steps: ScreenTestStep[] = screens.map((screen) => {
-    const { valid, boundary } = generateFieldInputs(screen.fields);
+    const inputs = buildScreenInputs(screen.fields, baseOverrides);
     if (screen.apiName !== targetScreen.apiName) {
-      return { screenApiName: screen.apiName, inputs: valid, assertions: [] };
+      return { screenApiName: screen.apiName, inputs, assertions: [] };
     }
+    const { boundary } = generateFieldInputs(screen.fields);
     const boundaryInput = boundary.find((b) => b.apiName === targetField.apiName);
-    const inputs = valid.map((i) => (i.apiName === targetField.apiName && boundaryInput ? boundaryInput : i));
+    const finalInputs = boundaryInput ? inputs.map((i) => (i.apiName === targetField.apiName ? boundaryInput : i)) : inputs;
     return {
       screenApiName: screen.apiName,
-      inputs,
+      inputs: finalInputs,
       assertions: [
         {
           type: "FieldRequiredEnforced",
@@ -157,55 +146,114 @@ function buildRequiredFieldBoundaryCase(screens: FlowScreen[], targetField: Flow
   });
 
   return {
-    id: `${targetField.apiName}-required-enforced`,
-    description: `Leave required field "${targetField.label}" blank on screen "${targetScreen.label}" and verify navigation is blocked`,
+    id: `${path.id}__${targetField.apiName}-required-enforced`,
+    description: `[${path.description}] Leave required field "${targetField.label}" blank on screen "${targetScreen.label}" and verify navigation is blocked`,
     steps,
+    pathId: path.id,
+    scenarioSource: "deterministic",
   };
 }
 
-function buildDeterministicSpec(flowModel: FlowModel): TestSpec {
-  const screens = screensInPath(flowModel);
-  const conditionalFields = collectConditionalFields(screens);
-  const unsupportedNotes: string[] = [];
+function generateCasesForPath(path: FlowPath, unsupportedNotes: string[], analysisNotes: string[]): TestCase[] {
+  const screens = path.nodes.filter((n): n is FlowScreen => n.kind === "Screen");
 
-  const testCases: TestCase[] = [];
+  // Base overrides: the assignments needed to actually route into this path
+  // via its Decision outcomes. If any is unsolvable or contradictory, this
+  // path can't be reliably driven — drop it entirely rather than guess.
+  let baseOverrides: Record<string, KnownValue> = {};
+  for (const [decisionApiName, outcomeApiName] of Object.entries(path.decisionOutcomeTaken)) {
+    const decisionIndex = path.nodes.findIndex((n) => n.apiName === decisionApiName);
+    const decisionNode = path.nodes[decisionIndex] as FlowDecision | undefined;
+    const outcome = decisionNode?.outcomes.find((o) => o.apiName === outcomeApiName);
+    if (!decisionNode || !outcome) continue; // shouldn't happen — path was built from this exact outcome
 
-  const drivers = [...new Set(conditionalFields.map((cf) => cf.driverApiName))];
-  if (drivers.length === 0) {
-    // No conditional fields at all — one straightforward happy-path case.
-    const steps: ScreenTestStep[] = screens.map((screen) => {
-      const { valid } = generateFieldInputs(screen.fields);
-      return { screenApiName: screen.apiName, inputs: valid, assertions: [] };
-    });
-    testCases.push({ id: "happy-path", description: "Complete the flow with valid data on every screen", steps });
-  } else {
-    for (const driver of drivers) {
-      for (const value of distinctDriverValues(conditionalFields, driver)) {
-        const { steps, description } = buildStepsForScenario(screens, conditionalFields, driver, value, unsupportedNotes);
-        testCases.push({ id: `${driver}-${value}`, description, steps });
+    const controllable = controllableFieldsUpTo(path.nodes, decisionIndex);
+    const solved = solveInputsForOutcome(outcome.conditionGroup, controllable);
+    if (!solved.solvable) {
+      analysisNotes.push(
+        `Path "${path.description}" needs Decision "${decisionNode.label}" to take outcome "${outcome.label}", but that can't be driven deterministically (${solved.reason}) — this path was not tested; add manual coverage.`
+      );
+      return [];
+    }
+    const merged = mergeAssignments(baseOverrides, solved.assignments);
+    if ("contradiction" in merged) {
+      analysisNotes.push(
+        `Path "${path.description}" has contradictory routing requirements across its decisions (${merged.contradiction}) — this path was not tested.`
+      );
+      return [];
+    }
+    baseOverrides = merged.merged;
+  }
+
+  // One additional scenario per conditional field whose own visibility
+  // condition can be solved without contradicting the path's own routing.
+  const scenarioKeys = new Set<string>([scenarioKey(baseOverrides)]);
+  const scenarios: Record<string, KnownValue>[] = [baseOverrides];
+
+  for (let i = 0; i < path.nodes.length; i++) {
+    const node = path.nodes[i];
+    if (node.kind !== "Screen") continue;
+    for (const field of node.fields) {
+      if (!field.visibilityRule) continue;
+      const controllable = controllableFieldsUpTo(path.nodes, i);
+      const solved = solveInputsForOutcome(field.visibilityRule, controllable);
+      if (!solved.solvable) {
+        unsupportedNotes.push(
+          `Field "${field.apiName}" on screen "${node.label}" has a visibility condition that can't be driven deterministically (${solved.reason}) — no scenario generated to prove it visible.`
+        );
+        continue;
       }
+      const merged = mergeAssignments(baseOverrides, solved.assignments);
+      if ("contradiction" in merged) {
+        unsupportedNotes.push(
+          `Field "${field.apiName}" on screen "${node.label}"'s visibility condition contradicts this path's own routing requirements (${merged.contradiction}) — it can never become visible on this path.`
+        );
+        continue;
+      }
+      const key = scenarioKey(merged.merged);
+      if (scenarioKeys.has(key)) continue;
+      scenarioKeys.add(key);
+      scenarios.push(merged.merged);
     }
   }
 
-  // One boundary case per always-visible required field (fields whose
-  // visibility itself depends on a condition are more involved to isolate
-  // and are covered implicitly by the scenario cases above already
-  // requiring them when visible).
+  const cases: TestCase[] = scenarios.map((scenario) => {
+    const label = describeScenarioDelta(scenario, baseOverrides);
+    const steps = buildStepsForScenario(path, screens, scenario, unsupportedNotes);
+    return {
+      id: `${path.id}__${label}`,
+      description:
+        label === "happy-path"
+          ? `[${path.description}] Complete the flow with valid data`
+          : `[${path.description}] Run with ${label} and verify conditional field visibility`,
+      steps,
+      pathId: path.id,
+      scenarioSource: "deterministic",
+    };
+  });
+
+  // Required-field boundary cases — only for fields that are ALWAYS
+  // required whenever this path reaches their screen (no visibilityRule of
+  // their own). Conditionally-required fields are covered implicitly by the
+  // scenarios above already requiring them once visible.
   for (const screen of screens) {
     for (const field of fillableFields(screen.fields)) {
       if (field.required && !field.visibilityRule) {
-        testCases.push(buildRequiredFieldBoundaryCase(screens, field, screen));
+        cases.push(buildRequiredFieldBoundaryCase(path, screens, field, screen, baseOverrides));
       }
     }
   }
 
-  const unsupportedSection =
-    unsupportedNotes.length > 0 ? `\n\n## Needs manual attention\n${[...new Set(unsupportedNotes)].map((n) => `- ${n}`).join("\n")}` : "";
+  return cases;
+}
 
-  const testPlanMarkdown = [
-    `# Test plan — ${flowModel.flowLabel}`,
-    "",
-    ...screens.map(
+function buildTestPlanMarkdown(flowModel: FlowModel, unsupportedNotes: string[], analysisNotes: string[]): string {
+  const screens = Object.values(flowModel.nodes).filter((n): n is FlowScreen => n.kind === "Screen");
+
+  const pathsSection = flowModel.paths.map((p) => `- **${p.id}**: ${p.description}`).join("\n");
+
+  const screensSection = screens
+    .map(
       (s) =>
         `## Screen: ${s.label}\n` +
         s.fields
@@ -219,22 +267,111 @@ function buildDeterministicSpec(flowModel: FlowModel): TestSpec {
             return `- ${f.label}${bits.length ? ` (${bits.join(", ")})` : ""}`;
           })
           .join("\n")
-    ),
-    unsupportedSection,
-  ].join("\n");
+    )
+    .join("\n\n");
+
+  const unsupportedSection =
+    unsupportedNotes.length > 0 ? `\n\n## Needs manual attention\n${[...new Set(unsupportedNotes)].map((n) => `- ${n}`).join("\n")}` : "";
+  const analysisSection =
+    analysisNotes.length > 0 ? `\n\n## Not analyzed / not testable automatically\n${[...new Set(analysisNotes)].map((n) => `- ${n}`).join("\n")}` : "";
+
+  return [`# Test plan — ${flowModel.flowLabel}`, "", `## Paths covered (branch coverage)`, pathsSection, "", screensSection, unsupportedSection, analysisSection].join(
+    "\n"
+  );
+}
+
+function buildDeterministicSpec(flowModel: FlowModel): TestSpec {
+  const unsupportedNotes: string[] = [];
+  const analysisNotes: string[] = [...flowModel.analysisNotes];
+
+  const testCases: TestCase[] = [];
+  for (const path of flowModel.paths) {
+    testCases.push(...generateCasesForPath(path, unsupportedNotes, analysisNotes));
+  }
 
   return {
     flowApiName: flowModel.flowApiName,
     flowType: "ScreenFlow",
-    generatedBy: "deterministic-fallback",
-    testPlanMarkdown,
+    generatedBy: "deterministic",
+    testPlanMarkdown: buildTestPlanMarkdown(flowModel, unsupportedNotes, analysisNotes),
     testCases,
   };
 }
 
-export async function generateTestSpec(flowModel: FlowModel): Promise<TestSpec> {
-  if (isLlmConfigured(config.llm.provider, config.llm.apiKey)) {
-    console.warn(`LLM provider "${config.llm.provider}" configured but not yet wired up — using deterministic generator.`);
+/** apiNames already exercised by deterministic generation — passed to the
+ *  LLM so it proposes ADDITIONAL scenarios rather than duplicating them. */
+function computeCoveredTargets(flowModel: FlowModel, deterministicCases: TestCase[]): string[] {
+  const covered = new Set<string>();
+  for (const tc of deterministicCases) {
+    for (const step of tc.steps ?? []) {
+      for (const assertion of step.assertions) covered.add(assertion.targetApiName);
+    }
   }
-  return buildDeterministicSpec(flowModel);
+  for (const path of flowModel.paths) {
+    for (const decisionApiName of Object.keys(path.decisionOutcomeTaken)) covered.add(decisionApiName);
+  }
+  for (const node of Object.values(flowModel.nodes)) {
+    if (node.kind === "RecordCreate" || node.kind === "RecordUpdate" || node.kind === "RecordDelete") covered.add(node.apiName);
+  }
+  return [...covered];
+}
+
+function createLlmProvider(): LlmScenarioProvider | undefined {
+  if (config.llm.provider === "anthropic") {
+    return new ClaudeScenarioProvider(config.llm.apiKey, config.llm.model, config.llm.effort);
+  }
+  if (config.llm.provider === "groq") {
+    return new GroqScenarioProvider(config.llm.apiKey, config.llm.model);
+  }
+  console.warn(`LLM_PROVIDER "${config.llm.provider}" is not recognized (implemented: "anthropic", "groq") — continuing with deterministic coverage only.`);
+  return undefined;
+}
+
+/**
+ * Deterministic generation always runs first and is the coverage baseline
+ * this function returns even if everything below fails. LLM-proposed
+ * scenarios (if configured) are validated (scenarioValidator.ts) and
+ * compiled (scenarioCompiler.ts) on top, additively — any failure at any
+ * step here degrades to deterministic-only, never throws.
+ */
+export async function generateTestSpec(flowModel: FlowModel): Promise<TestSpec> {
+  const deterministicSpec = buildDeterministicSpec(flowModel);
+
+  if (!isLlmConfigured(config.llm.provider, config.llm.apiKey)) {
+    return deterministicSpec;
+  }
+
+  try {
+    const provider = createLlmProvider();
+    if (!provider) return deterministicSpec;
+
+    const coveredTargets = computeCoveredTargets(flowModel, deterministicSpec.testCases);
+    const proposals = await provider.proposeScenarios({ flowModel, coveredTargets });
+    if (proposals.length === 0) return deterministicSpec;
+
+    const { valid, rejected } = validateScenarioProposals(flowModel, proposals);
+    const { cases: llmCases, notes: compileNotes } = compileScenarios(flowModel, valid);
+
+    const unusedNotes = [...rejected.map((r) => `LLM-proposed scenario "${r.proposal.id ?? "(no id)"}" was rejected: ${r.reason}.`), ...compileNotes];
+
+    let testPlanMarkdown = deterministicSpec.testPlanMarkdown;
+    if (llmCases.length > 0) {
+      testPlanMarkdown += `\n\n## LLM-proposed scenarios\n${llmCases.map((c) => `- ${c.id}: ${c.description}`).join("\n")}`;
+    }
+    if (unusedNotes.length > 0) {
+      testPlanMarkdown += `\n\n## LLM proposals not used\n${[...new Set(unusedNotes)].map((n) => `- ${n}`).join("\n")}`;
+    }
+
+    return {
+      ...deterministicSpec,
+      generatedBy: llmCases.length > 0 ? "deterministic+llm" : "deterministic",
+      testCases: [...deterministicSpec.testCases, ...llmCases],
+      testPlanMarkdown,
+    };
+  } catch (err) {
+    console.warn(
+      `LLM scenario proposal step failed unexpectedly (${err instanceof Error ? err.message : String(err)}) — continuing with deterministic coverage only.`
+    );
+    return deterministicSpec;
+  }
 }

@@ -1,5 +1,7 @@
 import { FlowField } from "../../types/flowModel";
 import { FieldInput } from "../../types/testSpec";
+import { KnownValue } from "./conditionEvaluator";
+import { BoundaryKind } from "./llmProvider";
 
 /**
  * Stage 2a — test data generation (design doc Section 4.3).
@@ -83,4 +85,67 @@ export function generateFieldInputs(fields: FlowField[]): { valid: FieldInput[];
     }));
 
   return { valid, boundary };
+}
+
+const FAR_FUTURE_DATE = "9999-12-31";
+const MAX_LENGTH_TEXT = "X".repeat(300); // well past any realistic Salesforce text field's 255-char default max
+
+/** Named boundary-value recipes beyond the single hardcoded one
+ *  generateFieldInputs uses — only ever invoked from scenarioCompiler.ts
+ *  when an LLM-proposed scenario names a specific boundaryKind. The
+ *  deterministic generator's own boundary generation (above) is untouched. */
+export function generateBoundaryValue(field: FlowField, kind: BoundaryKind): FieldInput {
+  let value: string | number | boolean;
+  switch (kind) {
+    case "MaxLength":
+      value = field.kind === "Text" || field.kind === "Email" ? MAX_LENGTH_TEXT : boundaryOrInvalidValueFor(field);
+      break;
+    case "InvalidFormat":
+      value = field.kind === "Email" ? "not-an-email" : field.kind === "Date" || field.kind === "DateTime" ? "not-a-date" : "!!!invalid!!!";
+      break;
+    case "Negative":
+      value = field.kind === "Number" || field.kind === "Currency" ? -999999 : boundaryOrInvalidValueFor(field);
+      break;
+    case "FarFutureDate":
+      value = field.kind === "Date" ? FAR_FUTURE_DATE : field.kind === "DateTime" ? `${FAR_FUTURE_DATE}T00:00:00.000Z` : boundaryOrInvalidValueFor(field);
+      break;
+    case "EmptyRequired":
+      value = "";
+      break;
+    case "Other":
+    default:
+      value = boundaryOrInvalidValueFor(field);
+      break;
+  }
+  return {
+    apiName: field.apiName,
+    locatorLabel: field.label,
+    value,
+    isBoundaryOrInvalid: true,
+    interactionKind: field.kind === "Lookup" ? "LookupSelect" : "Fill",
+    lookupObjectApiName: field.kind === "Lookup" ? field.lookupObjectApiName : undefined,
+    lookupSearchFieldApiName: field.kind === "Lookup" ? field.lookupSearchFieldApiName : undefined,
+  };
+}
+
+/** Builds inputs for one screen, using `overrides` (from
+ *  conditionEvaluator's solveInputsForOutcome) wherever a field's apiName
+ *  is present in it, and falling back to the same default valid value used
+ *  by generateFieldInputs otherwise. This is what lets a solved assignment
+ *  map (e.g. "Contact_Type must be 'New' to reach this path") actually turn
+ *  into a real, fillable input rather than just describing the requirement. */
+export function buildScreenInputs(fields: FlowField[], overrides: Record<string, KnownValue> = {}): FieldInput[] {
+  return fillableFields(fields).map((f) => {
+    const overrideValue = overrides[f.apiName];
+    const value = overrideValue !== undefined ? overrideValue : validValueFor(f);
+    return {
+      apiName: f.apiName,
+      locatorLabel: f.label,
+      value,
+      isBoundaryOrInvalid: false,
+      interactionKind: f.kind === "Lookup" ? "LookupSelect" : "Fill",
+      lookupObjectApiName: f.kind === "Lookup" ? f.lookupObjectApiName : undefined,
+      lookupSearchFieldApiName: f.kind === "Lookup" ? f.lookupSearchFieldApiName : undefined,
+    };
+  });
 }

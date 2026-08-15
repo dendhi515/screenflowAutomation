@@ -3,12 +3,13 @@
  * Every downstream stage (test data, test case generation, execution,
  * DML capture) consumes this — never the raw Flow XML directly.
  *
- * v2: modeled as a graph traversed from `start`, not a flat ordered list.
- * Document order in the XML has no guaranteed relationship to runtime
- * order once branching exists — see design doc addendum on the local-file
- * pivot. v1 scope only ever produces a linear path (no Decision elements
- * yet), but the graph shape is correct from the start so branching is an
- * incremental addition later, not a rewrite.
+ * v3: full graph model. Every node carries a uniform `next: string[]` (every
+ * apiName it could hand control to) so the graph can be walked/BFS'd
+ * identically regardless of node kind. `FlowModel.paths` holds multiple
+ * traversals — one base path plus one per non-default Decision outcome and
+ * one per Loop at 1 iteration (branch coverage, not exhaustive path
+ * coverage — see flowAnalyzer.ts `enumeratePaths`). Loop iteration modeling
+ * only supports 0 or 1 iterations by design — see flowAnalyzer.ts `walkPath`.
  */
 
 export type FlowType = "ScreenFlow"; // record-triggered support deferred per scope narrowing
@@ -20,15 +21,33 @@ export type FlowType = "ScreenFlow"; // record-triggered support deferred per sc
 export interface FlowCondition {
   /** API name of the field/resource/variable being compared. */
   leftValueReference: string;
-  operator: "EqualTo" | "NotEqualTo" | "IsNull" | "IsBlank" | "Contains" | string;
+  operator:
+    | "EqualTo"
+    | "NotEqualTo"
+    | "IsNull"
+    | "IsBlank"
+    | "Contains"
+    | "StartsWith"
+    | "EndsWith"
+    | "GreaterThan"
+    | "GreaterThanOrEqualTo"
+    | "LessThan"
+    | "LessThanOrEqualTo"
+    | string;
   rightValueLiteral?: string | number | boolean;
 }
 
-export interface FlowVisibilityRule {
-  /** e.g. "1", "1 AND 2", "and", "or" — how conditions combine. */
+/** One or more conditions combined via `conditionLogic` ("1", "1 AND 2",
+ *  "(1 AND 2) OR 3", or the literal strings "and"/"or"). Used both by a
+ *  screen field's visibilityRule and by a Decision outcome's own rule —
+ *  same shape, same evaluator (see stages/generate/conditionEvaluator.ts). */
+export interface FlowConditionGroup {
   conditionLogic: string;
   conditions: FlowCondition[];
 }
+
+/** Alias kept so existing "visibilityRule" call sites/imports don't break. */
+export type FlowVisibilityRule = FlowConditionGroup;
 
 export type FlowFieldKind =
   | "Text"
@@ -104,7 +123,106 @@ export interface FlowDmlElement {
   next: string[];
 }
 
-export type FlowGraphNode = FlowScreen | FlowDmlElement;
+/** One outcome ("rule" in the raw metadata) of a Decision element. Evaluated
+ *  first-match-wins at runtime, but for our purposes (branch coverage /
+ *  path enumeration) each outcome is just a named condition group with its
+ *  own connector target. */
+export interface FlowDecisionOutcome {
+  apiName: string;
+  label: string;
+  conditionGroup: FlowConditionGroup;
+  next: string;
+}
+
+export interface FlowDecision {
+  kind: "Decision";
+  apiName: string;
+  label: string;
+  outcomes: FlowDecisionOutcome[];
+  defaultNext?: string;
+  defaultLabel?: string;
+  /** Every outcome's next plus defaultNext, deduped — for reachability BFS. */
+  next: string[];
+}
+
+export interface FlowLoop {
+  kind: "Loop";
+  apiName: string;
+  label: string;
+  collectionReference: string;
+  /** nextValueConnector — where the loop body starts. */
+  nextValueTarget?: string;
+  /** noMoreValuesConnector — where control goes once the loop exits. */
+  noMoreValuesTarget?: string;
+  next: string[];
+}
+
+export interface FlowSubflow {
+  kind: "Subflow";
+  apiName: string;
+  label: string;
+  /** <flowName> — the called flow's API name. Its internals (screens, DML,
+   *  branching) are NOT analyzed — flagged in testPlanMarkdown instead of
+   *  guessed at. See flowAnalyzer.ts / design decision on subflow scope. */
+  calledFlowApiName: string;
+  inputAssignments: FlowFieldAssignment[];
+  next: string[];
+}
+
+export interface FlowRecordLookup {
+  kind: "RecordLookup";
+  apiName: string;
+  label: string;
+  objectApiName: string;
+  /** Only set when storeOutputAutomatically is false — an explicitly named
+   *  output variable. Its value is inherently org-data-dependent and can
+   *  never be statically known by the evaluator (see conditionEvaluator.ts) —
+   *  any condition depending on it resolves to `undefined`, not guessed. */
+  outputVariable?: string;
+  next: string[];
+}
+
+export interface FlowAssignmentItem {
+  targetReference: string;
+  /** "Assign" is the only operator the evaluator can reason about statically
+   *  (a straight literal/reference copy). Anything else makes the target
+   *  variable's value unknown going forward. */
+  operator: string;
+  value?:
+    | { kind: "literal"; literal: string | number | boolean }
+    | { kind: "elementReference"; reference: string };
+}
+
+export interface FlowAssignment {
+  kind: "Assignment";
+  apiName: string;
+  label: string;
+  assignmentItems: FlowAssignmentItem[];
+  next: string[];
+}
+
+export type FlowGraphNode =
+  | FlowScreen
+  | FlowDmlElement
+  | FlowDecision
+  | FlowLoop
+  | FlowSubflow
+  | FlowRecordLookup
+  | FlowAssignment;
+
+/** One traversal of the graph from start to an end/unmodeled node.
+ *  `id` is "base" for the default path, "<decisionApiName>__<outcomeApiName>"
+ *  for a decision-branch path, or "<loopApiName>__1x" for a loop-iteration
+ *  path — see flowAnalyzer.ts `enumeratePaths`. */
+export interface FlowPath {
+  id: string;
+  description: string;
+  nodes: FlowGraphNode[];
+  /** decisionApiName -> outcomeApiName forced on this path (empty on "base"). */
+  decisionOutcomeTaken: Record<string, string>;
+  /** loopApiName -> iteration count forced on this path (0 or 1; empty on "base"). */
+  loopIterationCounts: Record<string, number>;
+}
 
 export interface FlowModel {
   flowApiName: string;
@@ -114,8 +232,11 @@ export interface FlowModel {
   startElementApiName: string;
   /** All nodes reachable from start, keyed by their apiName. */
   nodes: Record<string, FlowGraphNode>;
-  /** Nodes in traversal order from start — for v1 (no Decision elements)
-   *  this is the single linear path; becomes one-of-many paths once
-   *  Decision/branch support is added. */
-  path: FlowGraphNode[];
+  /** Every path generated for this flow — branch coverage, not exhaustive
+   *  path coverage. Always has at least one entry ("base"). */
+  paths: FlowPath[];
+  /** Human-readable notes about things intentionally not analyzed (subflow
+   *  internals, unsolvable decision outcomes, RecordLookup-dependent
+   *  branches, etc.) — folded into testPlanMarkdown by the generator. */
+  analysisNotes: string[];
 }

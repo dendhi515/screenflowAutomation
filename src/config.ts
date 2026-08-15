@@ -9,6 +9,14 @@ function required(name: string, fallback?: string): string {
   return value;
 }
 
+/** LLM_MODEL is optional — falls back to a sensible default per provider so
+ *  "just set LLM_PROVIDER + LLM_API_KEY" works without also having to know
+ *  a specific model id. */
+function defaultModelFor(provider: string): string {
+  if (provider === "groq") return "openai/gpt-oss-120b";
+  return "claude-opus-5";
+}
+
 export const config = {
   port: Number(process.env.PORT ?? 3000),
   sessionSecret: process.env.SESSION_SECRET ?? "change-me-local-dev-only",
@@ -25,10 +33,19 @@ export const config = {
     callbackUrl: process.env.SF_CALLBACK_URL ?? "http://localhost:3000/oauth/callback",
   },
   llm: {
-    // Deferred per design doc Section 6 — empty means the deterministic
-    // fallback generator in stages/generate/testCaseGenerator.ts is used.
+    // Empty provider/apiKey means the deterministic generator in
+    // stages/generate/testCaseGenerator.ts runs alone — LLM-proposed
+    // scenarios (stages/generate/providers/*.ts) are additive, never
+    // required. Two providers implemented:
+    //  - "anthropic": paid, requires a key from console.anthropic.com (NOT
+    //    a claude.ai Pro/Max subscription — that's a separate product).
+    //  - "groq": free tier, no card required, requires a key from
+    //    console.groq.com. Good for a no-cost proof of concept before
+    //    switching to "anthropic" (or a paid Groq tier) later.
     provider: process.env.LLM_PROVIDER ?? "",
     apiKey: process.env.LLM_API_KEY ?? "",
+    model: process.env.LLM_MODEL ?? defaultModelFor(process.env.LLM_PROVIDER ?? ""),
+    effort: (process.env.LLM_EFFORT as "low" | "medium" | "high" | "xhigh" | "max" | undefined) ?? "medium",
   },
 };
 

@@ -42,6 +42,10 @@ export interface ExpectedAssertion {
   targetLabel: string;
   expectedValue?: string | number | boolean;
   description: string;
+  /** Set only for RecordFieldEquals — the object the DML element that should
+   *  produce this record targets, so recordAssertionReconciler.ts can match
+   *  it against capturedRecords without re-deriving it from the flow graph. */
+  objectApiName?: string;
 }
 
 export interface ScreenTestStep {
@@ -57,12 +61,18 @@ export interface TestCase {
   steps?: ScreenTestStep[];
   /** Only populated for record-triggered flows — Anonymous Apex body. */
   anonymousApex?: string;
+  /** Which path (flowModel.paths[].id) this case was generated against —
+   *  absent for cases not tied to a specific path (shouldn't normally happen). */
+  pathId?: string;
+  /** Whether this case came from the deterministic structural generator or
+   *  was proposed by the LLM and compiled/validated on top of it. */
+  scenarioSource: "deterministic" | "llm";
 }
 
 export interface TestSpec {
   flowApiName: string;
   flowType: "ScreenFlow";
-  generatedBy: "llm" | "deterministic-fallback";
+  generatedBy: "deterministic" | "deterministic+llm";
   testPlanMarkdown: string; // human-readable Gherkin/BDD plan for QA/business review
   testCases: TestCase[];
 }

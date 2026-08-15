@@ -1,25 +1,32 @@
 /** Local verification tool — not part of the running service, no server
  *  or Salesforce connection required. Run with:
- *  npx ts-node --transpile-only src/devSmokeTest.ts
- *  Exercises Stage 1 (parse) + Stage 2 (generate) against examples/
- *  Demo_Contact_Intake.flow-meta.xml so you can sanity-check the parser
- *  and test-case generator against a new flow file before wiring up
- *  Playwright/Salesforce at all. Point `filePath` below at a different
- *  .flow-meta.xml to try it against a real retrieved flow. */
+ *  npx ts-node --transpile-only src/devSmokeTest.ts [path-to-flow-meta.xml]
+ *  Exercises Stage 1 (parse) + Stage 2 (generate). Defaults to
+ *  examples/Demo_Contact_Intake.flow-meta.xml (single linear path — no
+ *  Decision/Loop); pass examples/Demo_Approval_Routing.flow-meta.xml (or a
+ *  real retrieved flow) as an argument to see branch-coverage path
+ *  enumeration in action. */
 import path from "path";
 import { analyzeFlowFromFile } from "./stages/analyze/flowAnalyzer";
 import { generateTestSpec } from "./stages/generate/testCaseGenerator";
 
 async function main() {
-  const filePath = path.join(__dirname, "..", "examples", "Demo_Contact_Intake.flow-meta.xml");
+  const filePathArg = process.argv[2];
+  const filePath = filePathArg ? path.resolve(filePathArg) : path.join(__dirname, "..", "examples", "Demo_Contact_Intake.flow-meta.xml");
   const model = analyzeFlowFromFile(filePath);
 
   console.log("=== FlowModel ===");
   console.log("flowApiName:", model.flowApiName);
-  console.log("path (traversal order):", model.path.map((n) => `${n.kind}:${n.apiName}`));
   console.log(
-    "fields per screen:",
-    model.path
+    "paths:",
+    model.paths.map((p) => ({ id: p.id, description: p.description, nodes: p.nodes.map((n) => `${n.kind}:${n.apiName}`) }))
+  );
+  if (model.analysisNotes.length > 0) {
+    console.log("analysis notes:", model.analysisNotes);
+  }
+  console.log(
+    "fields per screen (base path):",
+    (model.paths.find((p) => p.id === "base")?.nodes ?? [])
       .filter((n) => n.kind === "Screen")
       .map((s: any) => ({
         screen: s.apiName,
